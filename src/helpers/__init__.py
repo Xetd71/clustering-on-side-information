@@ -1,1 +1,3 @@
 from .default_values import DefaultValues
+from .farthest_first_traversal import farthest_first_traversal
+from .farthest_first_traversal import weighted_farthest_first_traversal
