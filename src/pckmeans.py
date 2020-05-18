@@ -1,98 +1,62 @@
-"""
-https://github.com/datamole-ai/active-semi-supervised-clustering
-"""
-
-
 import numpy as np
-from tqdm.auto import tqdm
-from .constraints import preprocess_constraints
+
+from src.kmeans_base import KMeansBase
 
 
-class PCKMeans:
-    def __init__(self, n_clusters=3, max_iter=100, w=1):
-        self.n_clusters = n_clusters
-        self.max_iter = max_iter
-        self.w = w
+class PCKMeans(KMeansBase):
+    def __init__(self, n_clusters=3, max_iter=30, w=0.001, eps=1e-6, verbose=1, random_seed=0):
+        super().__init__(n_clusters, max_iter, w, eps, verbose, random_seed=0)
 
-    def fit(self, X, y=None, ml=[], cl=[]):
-        # Preprocess constraints
-        ml_graph, cl_graph, neighborhoods = preprocess_constraints(ml, cl, X.shape[0])
-
-        # Initialize centroids
-        cluster_centers = self._initialize_cluster_centers(X, neighborhoods)
+    def fit(self, X, y=None, constraints=None):
+        # Initialize centroids; note init not like in PCKMeans
+        self.cluster_centers_ = self._init_cluster_centers(X)
 
         # Repeat until convergence
-        for _ in tqdm(range(self.max_iter), total=self.max_iter):
+        for step in np.arange(self.max_iter):
             # Assign clusters
-            labels = self._assign_clusters(X, cluster_centers, ml_graph, cl_graph, self.w)
+            self.labels_ = self._assign_clusters(X, self.cluster_centers_, constraints, self.w)
 
             # Estimate means
-            prev_cluster_centers = cluster_centers
-            cluster_centers = self._get_cluster_centers(X, labels)
+            prev_cluster_centers = self.cluster_centers_
+            self.cluster_centers_ = self._get_cluster_centers(X, self.labels_)
 
             # Check for convergence
-            difference = (prev_cluster_centers - cluster_centers)
-            converged = np.allclose(difference, np.zeros(cluster_centers.shape), atol=1e-6, rtol=0)
-
-            if converged: break
-
-        self.cluster_centers_, self.labels_ = cluster_centers, labels
-
+            cluster_shift = ((prev_cluster_centers - self.cluster_centers_)**2).sum(axis=1)
+            if self.verbose:
+                print(f"step = {step}, loss = {cluster_shift.mean():.6f}")
+            if (cluster_shift <= self.eps).all():
+               break
         return self
 
-    def _initialize_cluster_centers(self, X, neighborhoods):
-        neighborhood_centers = np.array([X[neighborhood].mean(axis=0) for neighborhood in neighborhoods])
-        neighborhood_sizes = np.array([len(neighborhood) for neighborhood in neighborhoods])
+    def _assign_clusters(self, X, cluster_centers, constraints, w):
+        centroid_distances = []
+        for centroid in cluster_centers:
+            cluster_distances = ((X - centroid)**2).sum(axis=1)
+            centroid_distances.append(cluster_distances)
+        centroid_distances = np.array(centroid_distances)
 
-        if len(neighborhoods) > self.n_clusters:
-            # Select K largest neighborhoods' centroids
-            cluster_centers = neighborhood_centers[np.argsort(neighborhood_sizes)[-self.n_clusters:]]
-        else:
-            if len(neighborhoods) > 0:
-                cluster_centers = neighborhood_centers
-            else:
-                cluster_centers = np.empty((0, X.shape[1]))
-
-            # FIXME look for a point that is connected by cannot-links to every neighborhood set
-
-            if len(neighborhoods) < self.n_clusters:
-                remaining_cluster_centers = X[np.random.choice(X.shape[0], self.n_clusters - len(neighborhoods), replace=False), :]
-                cluster_centers = np.concatenate([cluster_centers, remaining_cluster_centers])
-
-        return cluster_centers
-
-    def _objective_function(self, X, x_i, centroids, c_i, labels, ml_graph, cl_graph, w):
-        distance = 1 / 2 * np.sum((X[x_i] - centroids[c_i]) ** 2)
-
-        ml_penalty = 0
-        for y_i in ml_graph[x_i]:
-            if labels[y_i] != -1 and labels[y_i] != c_i:
-                ml_penalty += w
-
-        cl_penalty = 0
-        for y_i in cl_graph[x_i]:
-            if labels[y_i] == c_i:
-                cl_penalty += w
-
-        return distance + ml_penalty + cl_penalty
-
-    def _assign_clusters(self, X, cluster_centers, ml_graph, cl_graph, w):
         labels = np.full(X.shape[0], fill_value=-1)
-
-        index = list(range(X.shape[0]))
-        np.random.shuffle(index)
-        for x_i in index:
-            labels[x_i] = np.argmin([self._objective_function(X, x_i, cluster_centers, c_i, labels, ml_graph, cl_graph, w) for c_i in range(self.n_clusters)])
-
-        # Handle empty clusters
-        # See https://github.com/scikit-learn/scikit-learn/blob/0.19.1/sklearn/cluster/_k_means.pyx#L309
-        n_samples_in_cluster = np.bincount(labels, minlength=self.n_clusters)
-        empty_clusters = np.where(n_samples_in_cluster == 0)[0]
-
-        if len(empty_clusters) > 0:
-            raise Exception("Empty clusters")
-
+        constraints_distances = np.zeros(centroid_distances.shape)
+        np.random.seed(self.random_seed)
+        x_indexes = np.random.choice(X.shape[0], X.shape[0], replace=False)
+        for x_id in x_indexes:
+            x_label = (centroid_distances[:, x_id] + constraints_distances[:, x_id]).argmin()
+            labels[x_id] = x_label
+            constraints_distances[x_label] -= constraints[x_id] * w
         return labels
 
-    def _get_cluster_centers(self, X, labels):
-        return np.array([X[labels == i].mean(axis=0) for i in range(self.n_clusters)])
+
+if __name__ == "__main__":
+    import os
+
+    os.chdir("/Users/xetd71/Yandex.Disk.localized/Projects/clustering-on-side-information/data")
+
+    with open("X.npy", 'br') as f:
+        X = np.load(f).astype(float)
+    with open("constrains_01.npy", 'br') as f:
+        # constraints = np.ma.masked_values(np.load(f).astype(float), 0.0)
+        constraints = np.load(f).astype(float)
+
+    pck = PCKMeans(n_clusters=40, w=0.001)
+    pck.fit(X=X, constraints=constraints)
+

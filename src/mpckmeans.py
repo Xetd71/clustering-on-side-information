@@ -1,166 +1,130 @@
 import numpy as np
-import scipy
+from sklearn.metrics import pairwise_distances
+from tqdm.auto import tqdm
 
-from helpers import weighted_farthest_first_traversal
-from .constraints import preprocess_constraints
+from src.kmeans_base import KMeansBase
 
 np.seterr('raise')
 
 
-class MPCKMeans:
+class MPCKMeans(KMeansBase):
     "MPCK-Means-S-D that learns only a single (S) diagonal (D) matrix"
 
-    def __init__(self, n_clusters=3, max_iter=10, w=1):
-        self.n_clusters = n_clusters
-        self.max_iter = max_iter
-        self.w = w
+    def __init__(self, n_clusters=3, max_iter=30, w=0.001, eps=1e-6, verbose=1):
+        super().__init__(n_clusters, max_iter, w, eps, verbose)
 
-    def fit(self, X, y=None, ml=[], cl=[]):
+    def fit(self, X, y=None, constraints=None):
         # Preprocess constraints
-        ml_graph, cl_graph, neighborhoods = preprocess_constraints(ml, cl, X.shape[0])
 
         # Initialize cluster centers
-        cluster_centers = self._initialize_cluster_centers(X, neighborhoods)
+        self.cluster_centers = self._init_cluster_centers(X)
 
         # Initialize metrics
         A = np.identity(X.shape[1])
 
         # Repeat until convergence
-        for iteration in range(self.max_iter):
-            prev_cluster_centers = cluster_centers.copy()
-
+        for step in np.arange(self.max_iter):
             # Find farthest pair of points according to each metric
-            farthest = self._find_farthest_pairs_of_points(X, A)
+            farthest_dist, farthest_index = self._find_farthest_pairs_of_points(X, A)
 
             # Assign clusters
-            labels = self._assign_clusters(X, y, cluster_centers, A, farthest, ml_graph, cl_graph, self.w)
+            labels = self._assign_clusters(X, self.cluster_centers, A, farthest_dist, constraints, self.w)
 
             # Estimate means
-            cluster_centers = self._get_cluster_centers(X, labels)
+            prev_cluster_centers = self.cluster_centers
+            self.cluster_centers = self._get_cluster_centers(X, labels)
 
             # Update metrics
-            A = self._update_metrics(X, labels, cluster_centers, farthest, ml_graph, cl_graph, self.w)
+            A = self._update_metrics(X, labels, self.cluster_centers, farthest_index, constraints, self.w)
 
             # Check for convergence
-            cluster_centers_shift = (prev_cluster_centers - cluster_centers)
-            converged = np.allclose(cluster_centers_shift, np.zeros(cluster_centers.shape), atol=1e-6, rtol=0)
-
-            if converged:
+            cluster_shift = ((prev_cluster_centers - self.cluster_centers_)**2).sum(axis=1)
+            if self.verbose:
+                print(f"step = {step}, loss = {cluster_shift.mean():.6f}")
+            if (cluster_shift <= self.eps).all():
                 break
-
-        # print('\t', iteration, converged)
-
-        self.cluster_centers_, self.labels_ = cluster_centers, labels
 
         return self
 
     def _find_farthest_pairs_of_points(self, X, A):
-        farthest = None
-        n = X.shape[0]
-        max_distance = 0
-
-        for i in range(n):
-            for j in range(n):
-                if j < i:
-                    distance = self._dist(X[i], X[j], A)
-                    if distance > max_distance:
-                        max_distance = distance
-                        farthest = (i, j, distance)
-
-        assert farthest is not None
-
-        return farthest
-
-    def _initialize_cluster_centers(self, X, neighborhoods):
-        neighborhood_centers = np.array([X[neighborhood].mean(axis=0) for neighborhood in neighborhoods])
-        neighborhood_sizes = np.array([len(neighborhood) for neighborhood in neighborhoods])
-        neighborhood_weights = neighborhood_sizes / neighborhood_sizes.sum()
-
-        # print('\t', len(neighborhoods), neighborhood_sizes)
-
-        if len(neighborhoods) > self.n_clusters:
-            cluster_centers = neighborhood_centers[weighted_farthest_first_traversal(neighborhood_centers, neighborhood_weights, self.n_clusters)]
-        else:
-            if len(neighborhoods) > 0:
-                cluster_centers = neighborhood_centers
-            else:
-                cluster_centers = np.empty((0, X.shape[1]))
-
-            if len(neighborhoods) < self.n_clusters:
-                remaining_cluster_centers = X[np.random.choice(X.shape[0], self.n_clusters - len(neighborhoods), replace=False), :]
-                cluster_centers = np.concatenate([cluster_centers, remaining_cluster_centers])
-
-        return cluster_centers
+        farthest_index = np.unravel_index(pairwise_distances(X).argmax(), (X.shape[0], X.shape[0]))
+        farthest_dist = self._dist(X[farthest_index[0]], X[farthest_index[1]], A)
+        return farthest_dist, farthest_index
 
     def _dist(self, x, y, A):
-        "(x - y)^T A (x - y)"
-        return scipy.spatial.distance.mahalanobis(x, y, A) ** 2
+        return np.sqrt((x - y).dot(A).dot((x - y).T))
 
-    def _objective_fn(self, X, i, labels, cluster_centers, cluster_id, A, farthest, ml_graph, cl_graph, w):
-        term_d = self._dist(X[i], cluster_centers[cluster_id], A) - np.log(np.linalg.det(A)) / np.log(2)  # FIXME is it okay that it might be negative?
+    def _dist_matrix(self, X, y, A):
+        return np.array([np.sqrt((y - x).dot(A).dot((y - x).T)) for x in X])
 
-        def f_m(i, j, A):
-            return self._dist(X[i], X[j], A)
+    def _assign_clusters(self, X, cluster_centers, constraints, w):
+        centroid_distances = []
+        for centroid in cluster_centers:
+            cluster_distances = ((X - centroid)**2).sum(axis=1)
+            centroid_distances.append(cluster_distances)
+        centroid_distances = np.array(centroid_distances)
 
-        def f_c(i, j, A, farthest):
-            return farthest[2] - self._dist(X[i], X[j], A)
-
-        term_m = 0
-        for j in ml_graph[i]:
-            if labels[j] >= 0 and labels[j] != cluster_id:
-                term_m += 2 * w * f_m(i, j, A)
-
-        term_c = 0
-        for j in cl_graph[i]:
-            if labels[j] == cluster_id:
-                # assert f_c(i, j, A, farthest) >= 0
-                term_c += 2 * w * f_c(i, j, A, farthest)
-
-        return term_d + term_m + term_c
-
-    def _assign_clusters(self, X, y, cluster_centers, A, farthest, ml_graph, cl_graph, w):
         labels = np.full(X.shape[0], fill_value=-1)
-
-        index = list(range(X.shape[0]))
-        np.random.shuffle(index)
-        for i in index:
-            labels[i] = np.argmin([self._objective_fn(X, i, labels, cluster_centers, cluster_id, A, farthest, ml_graph, cl_graph, w) for cluster_id, cluster_center in enumerate(cluster_centers)])
-
-        # Handle empty clusters
-        # See https://github.com/scikit-learn/scikit-learn/blob/0.19.1/sklearn/cluster/_k_means.pyx#L309
-        n_samples_in_cluster = np.bincount(labels, minlength=self.n_clusters)
-        empty_clusters = np.where(n_samples_in_cluster == 0)[0]
-
-        if len(empty_clusters) > 0:
-            raise Exception("Empty clusters")
-
+        constraints_distances = np.zeros(centroid_distances.shape)
+        np.random.seed(self.random_seed)
+        x_indexes = np.random.choice(X.shape[0], X.shape[0], replace=False)
+        for x_id in x_indexes:
+            x_label = (centroid_distances[:, x_id] + constraints_distances[:, x_id]).argmin()
+            labels[x_id] = x_label
+            constraints_distances[x_label] -= constraints[x_id] * w
         return labels
 
-    def _update_metrics(self, X, labels, cluster_centers, farthest, ml_graph, cl_graph, w):
+    def _assign_clusters(self, X, cluster_centers, A, farthest_dist, constraints, w):
+        centroid_distances = []
+        for centroid in cluster_centers:
+            cluster_distances = self._dist_matrix(X, centroid, A)
+            centroid_distances.append(cluster_distances)
+        centroid_distances = np.array(centroid_distances)
+
+        ML = (constraints > 0).astype(float)
+        CL = (constraints < 0).astype(float)
+
+        labels = np.full(X.shape[0], fill_value=-1)
+        constraints_distances = np.zeros(centroid_distances.shape)
+        np.random.seed(self.random_seed)
+        x_indexes = np.random.choice(X.shape[0], X.shape[0], replace=False)
+        for x_id in tqdm(x_indexes):
+            x_label = (centroid_distances[:, x_id] + constraints_distances[:, x_id]).argmin()
+            labels[x_id] = x_label
+            x_distances = self._dist_matrix(X, X[x_id], A)
+            constraints_distances[x_label] -= ML[x_id] * w * x_distances
+            constraints_distances[x_label] += CL[x_id] * w * (farthest_dist - x_distances)
+        return labels
+
+    def _update_metrics(self, X, labels, cluster_centers, farthest_index, constraints, w):
+        TERM_X = ((X - cluster_centers[labels])**2).sum(axis=0)
+        T = (X[farthest_index[0]] - X[farthest_index[1]])**2
+
+        label_similarity = (labels.reshape(-1, 1) == labels.reshape(1, -1)).astype(float)
+        ML = (constraints > 0).astype(float) * (1 - label_similarity)
+        CL = (constraints < 0).astype(float) * label_similarity
+
         N, D = X.shape
         A = np.zeros((D, D))
-
         for d in range(D):
-            term_x = np.sum([(x[d] - cluster_centers[labels[i], d]) ** 2 for i, x in enumerate(X)])
-
-            term_m = 0
-            for i in range(N):
-                for j in ml_graph[i]:
-                    if labels[i] != labels[j]:
-                        term_m += 1 / 2 * w * (X[i, d] - X[j, d]) ** 2
-
-            term_c = 0
-            for i in range(N):
-                for j in cl_graph[i]:
-                    if labels[i] == labels[j]:
-                        tmp = ((X[farthest[0], d] - X[farthest[1], d]) ** 2 - (X[i, d] - X[j, d]) ** 2)
-                        term_c += w * max(tmp, 0)
-
-            # print('term_x', term_x, 'term_m', term_m, 'term_c', term_c)
-
-            A[d, d] = N * 1 / max(term_x + term_m + term_c, 1e-9)
-
+            X_d_diff = pairwise_distances(X[:, d])
+            term_x = TERM_X[d]
+            term_m = 1 / 2 * (w * ML * X_d_diff)
+            term_c = w * CL * (T[d] - X_d_diff)
+            A[d, d] = N / max(term_x + term_m + term_c, 1e-9)
         return A
 
-    def _get_cluster_centers(self, X, labels):
-        return np.array([X[labels == i].mean(axis=0) for i in range(self.n_clusters)])
+
+if __name__ == "__main__":
+    import os
+
+    os.chdir("/Users/xetd71/Yandex.Disk.localized/Projects/clustering-on-side-information/data")
+
+    with open("X.npy", 'br') as f:
+        X = np.load(f).astype(float)
+    with open("constrains_01.npy", 'br') as f:
+        # constrains = np.ma.masked_values(np.load(f).astype(float), 0.0)
+        constraints = np.load(f).astype(float)
+
+    pck = MPCKMeans(n_clusters=40, w=0.001)
+    pck.fit(X=X, constraints=constraints)
